@@ -6,6 +6,7 @@ import 'package:flutter/material.dart';
 import 'package:record/record.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 import 'package:permission_handler/permission_handler.dart';
+import 'package:audioplayers/audioplayers.dart'; // <-- Added import
 
 class AudioStreamPage extends StatefulWidget {
   const AudioStreamPage({super.key});
@@ -47,6 +48,7 @@ class ChatMessage {
 class _AudioStreamPageState extends State<AudioStreamPage> {
   final AudioRecorder _recorder = AudioRecorder();
   final ScrollController _scrollController = ScrollController();
+  final AudioPlayer _audioPlayer = AudioPlayer(); // <-- Added AudioPlayer
 
   WebSocketChannel? _channel;
   StreamSubscription<Uint8List>? _audioStreamSubscription;
@@ -55,6 +57,10 @@ class _AudioStreamPageState extends State<AudioStreamPage> {
   bool _isConnected = false;
   bool _isRecording = false;
   bool _waitingForReply = false;
+  
+  // Audio streaming state
+  bool _isReceivingAudio = false;
+  final List<int> _audioBuffer = [];
 
   Stopwatch? _responseStopwatch;
   Timer? _recordingTimer;
@@ -77,6 +83,7 @@ class _AudioStreamPageState extends State<AudioStreamPage> {
     _wsSubscription?.cancel();
     _channel?.sink.close();
     _recorder.dispose();
+    _audioPlayer.dispose(); // <-- Clean up player
     _scrollController.dispose();
     super.dispose();
   }
@@ -109,21 +116,53 @@ class _AudioStreamPageState extends State<AudioStreamPage> {
   }
 
   void _onServerMessage(dynamic message) {
+    // Check if the message is binary (audio chunk)
+    if (message is List<int>) {
+      if (_isReceivingAudio) {
+        _audioBuffer.addAll(message);
+      }
+      return;
+    }
+
+    // Otherwise, assume it's a string message (JSON)
+    if (message is String) {
+      try {
+        final decoded = jsonDecode(message) as Map<String, dynamic>;
+
+        // Handle Audio Start Marker
+        if (decoded['type'] == 'audio_start') {
+          _isReceivingAudio = true;
+          _audioBuffer.clear();
+          return;
+        }
+
+        // Handle Audio End Marker
+        if (decoded['type'] == 'audio_end') {
+          _isReceivingAudio = false;
+          _playBufferedAudio();
+          return;
+        }
+
+        // Handle text reply or error
+        _handleTextResponse(decoded);
+      } catch (e) {
+        debugPrint('Failed to parse text message: $e');
+        _handleTextResponse({'reply': message}); // Fallback to raw string
+      }
+    }
+  }
+  
+  void _handleTextResponse(Map<String, dynamic> decoded) {
     _responseStopwatch?.stop();
     final elapsed = _responseStopwatch?.elapsed ?? Duration.zero;
-
+    
     String replyText;
-    try {
-      final decoded = jsonDecode(message as String) as Map<String, dynamic>;
-      if (decoded.containsKey('error')) {
-        replyText = 'Error: ${decoded['error']}';
-      } else {
-        replyText = (decoded['reply'] as String?)?.trim().isNotEmpty == true
-            ? decoded['reply']
-            : '(no reply)';
-      }
-    } catch (e) {
-      replyText = message.toString();
+    if (decoded.containsKey('error')) {
+      replyText = 'Error: ${decoded['error']}';
+    } else {
+      replyText = (decoded['reply'] as String?)?.trim().isNotEmpty == true
+          ? decoded['reply']!
+          : '(no reply)';
     }
 
     setState(() {
@@ -147,6 +186,19 @@ class _AudioStreamPageState extends State<AudioStreamPage> {
 
     _scrollToBottom();
   }
+  
+  Future<void> _playBufferedAudio() async {
+    if (_audioBuffer.isEmpty) return;
+    
+    try {
+      final bytes = Uint8List.fromList(_audioBuffer);
+      // Play the MP3 bytes using audioplayers
+      await _audioPlayer.play(BytesSource(bytes));
+    } catch (e) {
+      debugPrint("Error playing audio: $e");
+      _showSnack("Failed to play response audio");
+    }
+  }
 
   Future<void> _startRecording() async {
     if (!_isConnected) {
@@ -164,6 +216,9 @@ class _AudioStreamPageState extends State<AudioStreamPage> {
       _showSnack('Microphone permission denied');
       return;
     }
+    
+    // Stop any currently playing audio when starting a new recording
+    await _audioPlayer.stop();
 
     try {
       const config = RecordConfig(
@@ -297,28 +352,26 @@ class _AudioStreamPageState extends State<AudioStreamPage> {
       ),
       body: SafeArea(
         child: Column(
-        children: [
-          Expanded(
-            child: _messages.isEmpty
-                ? const Center(
-                    child: Text(
-                      'Tap the mic and start talking',
-                      style: TextStyle(color: Colors.grey),
+          children: [
+            Expanded(
+              child: _messages.isEmpty
+                  ? const Center(
+                      child: Text(
+                        'Tap the mic and start talking',
+                        style: TextStyle(color: Colors.grey),
+                      ),
+                    )
+                  : ListView.builder(
+                      controller: _scrollController,
+                      padding: const EdgeInsets.all(12),
+                      itemCount: _messages.length,
+                      itemBuilder: (context, index) => _buildBubble(_messages[index]),
                     ),
-                  )
-                : ListView.builder(
-                    controller: _scrollController,
-                    padding: const EdgeInsets.all(12),
-                    itemCount: _messages.length,
-                    itemBuilder: (context, index) => _buildBubble(_messages[index]),
-                  ),
-          ),
-          _buildRecordingBar(),
-        ],
-      ),
+            ),
+            _buildRecordingBar(),
+          ],
+        ),
       )
-      
-      
     );
   }
 
